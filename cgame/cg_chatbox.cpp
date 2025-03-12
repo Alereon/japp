@@ -259,69 +259,104 @@ void CG_ChatboxOutgoing(void) {
 
 static const char *preMatches[] = {"www.", "://"};
 static const char *postMatches[] = {".com", ".org", ".net", ".ru", ".co.uk", ".ua", ".tk", ".biz", ".tk"};
+static int numPreMatches = sizeof(preMatches) / sizeof(preMatches[0]);
+static int numPostMatches = sizeof(postMatches) / sizeof(postMatches[0]);
 
-// returns 0 if no URLs were found
-// else return an offset into message where the first URL is located
-// call multiple times to parse multiple urls
-static size_t CG_ParseURLs(char *message) {
-    char scratch[MAX_SAY_TEXT];
-    std::memcpy(scratch, message, sizeof(scratch));
+static void CG_ParseURLS(chatEntry_t *msg) {
+    const char *p;
+    size_t offset = 0;
+    size_t len;
+    if (!msg || !msg->message[0]) {
+        return;
+    }
+    p = msg->message;
+    len = strlen(msg->message);
 
-    const char *delim = " ";
-    for (char *p = strtok(scratch, delim); p; p = strtok(NULL, delim)) {
-        // skip colour codes
-        while (Q_IsColorString(p)) {
+    while (*p) {
+
+       // Skip colour codes
+        if (Q_IsColorString(p)) {
             p += 2;
+            offset += 2;
+            continue;
         }
 
-        ptrdiff_t offset = p - scratch;
-        size_t len = strlen(p);
-        for (const char *preMatch : preMatches) {
-            size_t matchLen = strlen(preMatch);
-            if (len < matchLen) {
-                break;
+        // Set the offset of a new word
+        if (*p == ' ') {
+            p++;
+            offset = p - msg->message;
+            continue;
+        }
+        // Check for URL patterns starting at current word offset
+        if (offset) {
+            const char *wordStart;
+            const char *wordEnd;
+
+            // Did the string end?
+            if (offset >= len) {
+                return;
             }
-            if (!Q_strncmp(p, preMatch, matchLen)) {
-                // got a pre match, try to verify with a post match
-                for (char *dot = p; (dot = strchr(dot, '.')) != nullptr; dot++) {
-                    for (const char *postMatch : postMatches) {
-                        size_t matchLen = strlen(postMatch);
-                        if (len < matchLen) {
-                            break;
-                        }
-                        if (!Q_strncmp(dot, postMatch, matchLen)) {
-                            const char *p2 = postMatch;
-                            while (p2 - p > 0) {
-                                p2--;
-                                if (*--p2 == ' ') {
-                                    size_t realPreLength = postMatch - p2;
-                                    offset = (p - scratch) - realPreLength;
-                                    break;
-                                }
-                            }
-                            return offset;
-                        }
-                    }
+
+            wordStart = wordEnd = p;
+
+            // Skip to end of current word
+            while (*wordEnd && *wordEnd != ' ') {
+
+                // Skip embedded colour codes within words
+                if (Q_IsColorString(wordEnd)) {
+                    wordEnd += 2;
+                    continue;
                 }
-            }
-        }
 
-        // no pre matches, can still try post matches
-        for (char *dot = p; (dot = strchr(dot, '.')) != nullptr; dot++) {
-            for (const char *postMatch : postMatches) {
-                size_t matchLen = strlen(postMatch);
-                if (len < matchLen) {
+                wordEnd++;
+            }
+
+            // Look for prematch patterns
+            qboolean foundPreMatch = false;
+            for (int i = 0; i < numPreMatches; i++) {
+                size_t preMatchLen = strlen(preMatches[i]);
+                if ((wordStart + preMatchLen) <= wordEnd && !Q_strncmp(wordStart, preMatches[i], preMatchLen)) {
+                    foundPreMatch = true;
                     break;
                 }
-                if (!Q_strncmp(dot, postMatch, matchLen)) {
-                    return offset;
+            }
+
+            // Look for postmatch patterns
+            qboolean foundPostMatch = false;
+            for (int i = 0; i < numPostMatches; i++) {
+                const char *postMatchPos = Q_stristr(wordStart, postMatches[i]);
+                if (postMatchPos && postMatchPos == wordEnd - strlen(postMatches[i])) {
+                    foundPostMatch = true;
+                    break;
                 }
             }
-        }
-    }
 
-    // no pre or post match
-    return 0u;
+            // If valid URL found, create a new URL location
+            if ((foundPreMatch && foundPostMatch) || (!foundPreMatch && foundPostMatch)) {
+                chatEntry_t::urlLocation *loc = new chatEntry_t::urlLocation{};
+                loc->start = offset;
+                loc->length = (size_t)(wordEnd - wordStart);
+
+                // Copy and clean the URL text
+                Q_strncpyz(loc->text, msg->message + loc->start, loc->length + 1);
+                Q_CleanString(loc->text, STRIP_COLOUR);
+
+                // Add to linked list
+                loc->next = msg->URLs;
+                msg->URLs = loc;
+
+                // Skip to end of this word - we've processed it
+                p = wordEnd;
+                offset = 0;
+                continue;
+            }
+
+            // Reset offset for next word
+            offset = 0;
+        }
+        // Move to next character
+        p++;
+    }
 }
 
 // This function is called recursively when a logical message has to be split into multiple lines
@@ -383,6 +418,10 @@ void CG_ChatboxAddMessage(const char *message, qboolean multiLine, const char *c
             memmove(&cb->chatBuffer[0], &cb->chatBuffer[1], sizeof(cb->chatBuffer) - sizeof(chatEntry_t));
             memset(chat, 0, sizeof(chatEntry_t)); // Clear the last element, ready for writing
             Q_strncpyz(chat->message, message, i + 1);
+
+            // parse out URLs
+            CG_ParseURLS(chat);
+
             chat->time = cg.time + cg_chatbox.integer;
 
             // Insert time-stamp, only for entries on the first line
@@ -436,22 +475,7 @@ void CG_ChatboxAddMessage(const char *message, qboolean multiLine, const char *c
     Q_strncpyz(chat->message, message, i + 1);
 
     // parse out URLs
-    size_t offset = 0u, tmpOffset = 0u;
-    while ((tmpOffset = CG_ParseURLs(chat->message + offset)) != 0u) {
-        chatEntry_t::urlLocation *loc = new chatEntry_t::urlLocation{};
-        loc->start = offset + tmpOffset;
-        offset = tmpOffset;
-        const char *p = strchr(chat->message + offset, ' ');
-        if (p) {
-            loc->length = p - (chat->message + offset) + 1;
-        } else {
-            loc->length = strlen(chat->message + offset) + 1;
-        }
-        Q_strncpyz(loc->text, chat->message + loc->start, loc->length);
-        Q_CleanString(loc->text, STRIP_COLOUR);
-        loc->next = chat->URLs;
-        chat->URLs = loc;
-    }
+    CG_ParseURLS(chat);
 
     chat->time = cg.time + cg_chatbox.integer;
 
@@ -630,7 +654,7 @@ void CG_ChatboxDraw(void) {
                         // FIXME: somehow this isn't accurate when using r_aspectCorrectFonts?!
                         url->pos.x = cg.chatbox.pos.x + font.Width(scratch);
 
-                        Q_strncpyz(scratch, tmp + url->start + timestampLength, url->length);
+                        Q_strncpyz(scratch, tmp + url->start + timestampLength, url->length + 1);
                         url->size.x = font.Width(scratch);
 
                         url->pos.y = cg.chatbox.pos.y + yAccum - (height / 2.0f);
